@@ -47,11 +47,21 @@ ENV_SEC = FIXED["security_mo"]
 ENV_TOTAL = ENV_NAT + ENV_IP + ENV_DTO + ENV_SEC
 
 MACHINES = [
-    ("t3.large", 2, 8), ("t3.xlarge", 4, 16),
+    # small / general
+    ("t3.large", 2, 8), ("t3.xlarge", 4, 16), ("t3.2xlarge", 8, 32),
+    # compute-lean (low RAM per CPU)
+    ("c6i.xlarge", 4, 8), ("c6i.2xlarge", 8, 16), ("c6i.4xlarge", 16, 32), ("c6i.8xlarge", 32, 64),
+    # balanced
     ("m6i.xlarge", 4, 16), ("m6i.2xlarge", 8, 32), ("m6i.4xlarge", 16, 64),
-    ("r6i.xlarge", 4, 32), ("r6i.2xlarge", 8, 64), ("r6i.4xlarge", 16, 128), ("r6i.8xlarge", 32, 256),
-    ("r6a.xlarge", 4, 32), ("r6a.2xlarge", 8, 64), ("r6a.4xlarge", 16, 128),
-    ("x2iedn.xlarge", 4, 128), ("x2iedn.2xlarge", 8, 256), ("x2iedn.4xlarge", 16, 512),
+    ("m6i.8xlarge", 32, 128), ("m6i.12xlarge", 48, 192), ("m6i.16xlarge", 64, 256),
+    # memory-heavy (databases)
+    ("r6a.xlarge", 4, 32), ("r6a.2xlarge", 8, 64), ("r6a.4xlarge", 16, 128), ("r6a.8xlarge", 32, 256),
+    ("r6i.xlarge", 4, 32), ("r6i.2xlarge", 8, 64), ("r6i.4xlarge", 16, 128),
+    ("r6i.8xlarge", 32, 256), ("r6i.12xlarge", 48, 384), ("r6i.16xlarge", 64, 512),
+    # extreme memory per CPU
+    ("x8i.2xlarge", 8, 128), ("x8i.4xlarge", 16, 256),
+    ("x2iedn.xlarge", 4, 128), ("x2iedn.2xlarge", 8, 256),
+    ("x2iedn.4xlarge", 16, 512), ("x2iedn.8xlarge", 32, 1024),
 ]
 
 
@@ -150,6 +160,19 @@ except Exception as e:
     st.stop()
 
 st.caption(f"Live official AWS prices, fetched {P['fetched']} · Servers assumed running 24/7 · Region us-east-1")
+
+with st.expander("🔍 See all machines and today's prices (for checking)"):
+    st.dataframe(pd.DataFrame([
+        {"Machine": r["type"], "CPU": r["cpu"], "RAM GB": r["ram"],
+         "Windows $/hr": round(r["win_hr"], 5),
+         "SQL portion $/hr": round(r["sql_hr_full"], 5) if r["sql_hr_full"] else None}
+        for r in P["machines"]
+    ]), use_container_width=True, hide_index=True)
+    priced = {r["type"] for r in P["machines"]}
+    missing = [t for t, _, _ in MACHINES if t not in priced]
+    if missing:
+        st.warning("No price found for: " + ", ".join(missing) +
+                   " — these machines are ignored by the matcher until pricing works.")
 
 if "servers" not in st.session_state:
     st.session_state.servers = []
