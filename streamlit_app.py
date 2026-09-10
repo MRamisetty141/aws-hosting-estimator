@@ -40,6 +40,12 @@ FIXED = {
 
 TERM_DISC = {"On-Demand": 1.00, "1-Year": 0.78, "3-Year": 0.60}
 
+ENV_NAT = FIXED["nat_gateways"] * FIXED["nat_hr"] * HOURS_MO + FIXED["nat_data_gb"] * FIXED["nat_gb_rate"]
+ENV_IP = FIXED["public_ips"] * FIXED["ip_hr"] * HOURS_MO
+ENV_DTO = FIXED["data_out_gb"] * FIXED["dto_rate"]
+ENV_SEC = FIXED["security_mo"]
+ENV_TOTAL = ENV_NAT + ENV_IP + ENV_DTO + ENV_SEC
+
 MACHINES = [
     ("t3.large", 2, 8), ("t3.xlarge", 4, 16),
     ("m6i.xlarge", 4, 16), ("m6i.2xlarge", 8, 32), ("m6i.4xlarge", 16, 64),
@@ -196,12 +202,15 @@ if sql:
 tbl += "| Disks (" + str(disk_gb) + " GB) | " + " | ".join(f"${CT[t]['disk']:,.0f}" for t in TERM_DISC) + " |\n"
 tbl += "| Daily backups | " + " | ".join(f"${CT[t]['backup']:,.0f}" for t in TERM_DISC) + " |\n"
 tbl += "| **Total / month** | " + " | ".join(f"**${CT[t]['total']:,.0f}**" for t in TERM_DISC) + " |"
+tbl += "\n| **PAY AMOUNT — everything included (server + environment + 25%)** | " + " | ".join(f"**${(CT[t]['total'] + ENV_TOTAL) * (1 + FIXED['markup']):,.0f}**" for t in TERM_DISC) + " |"
 st.markdown(tbl)
-st.caption("Commitments discount only the machine — never the SQL license, disks or backups. "
+st.caption("The PAY AMOUNT row is the complete monthly price for a one-server setup — nothing to add on top. With several servers the environment is charged once (see section 3). "
+           "Commitments discount only the machine — never the SQL license, disks or backups. "
            "A commitment must be paid for the whole period, even if the client leaves early.")
 
 term = st.radio("Which pricing do you want in the estimate?", list(TERM_DISC.keys()), horizontal=True)
-if st.button(f"➕ Add '{name}' to the estimate ({term}: ${CT[term]['total']:,.0f}/mo)",
+allin = (CT[term]["total"] + ENV_TOTAL) * (1 + FIXED["markup"])
+if st.button(f"➕ Add '{name}' to the estimate — pay amount ${allin:,.0f}/mo everything included",
              type="primary", use_container_width=True):
     st.session_state.servers.append({"name": name, "cpu": cpu, "ram": ram, "sql": sql,
                                      "disk": disk_gb, "term": term,
@@ -236,13 +245,32 @@ else:
                            "Disks $": round(c["disk"]), "Backups $": round(c["backup"]),
                            "Total $/mo": round(c["total"])})
 
-    nat = FIXED["nat_gateways"] * FIXED["nat_hr"] * HOURS_MO + FIXED["nat_data_gb"] * FIXED["nat_gb_rate"]
-    ip = FIXED["public_ips"] * FIXED["ip_hr"] * HOURS_MO
-    dto = FIXED["data_out_gb"] * FIXED["dto_rate"]
-    sec = FIXED["security_mo"]
-    shared = nat + ip + dto + sec
+    nat, ip, dto, sec = ENV_NAT, ENV_IP, ENV_DTO, ENV_SEC
+    shared = ENV_TOTAL
     aws_total = server_total + shared
     client_mo = aws_total * (1 + FIXED["markup"])
+
+    st.markdown("**The complete environment** — everything Saratech creates in the client's dedicated AWS account:")
+    ENV_ITEMS = [
+        ("Dedicated AWS account for this client", "Their own isolated space, own bill", 0),
+        ("Private network (VPC)", "The client's own fenced network inside AWS", 0),
+        ("Private subnets for the servers", "Servers are NOT reachable from the internet directly", 0),
+        ("Public subnet for the internet door", "Where the NAT gateway lives", 0),
+        ("Firewall rules (security groups)", "Only allowed traffic can reach each server", 0),
+        ("Routing + internet gateway", "Traffic direction inside the network", 0),
+        ("User access & permissions (IAM)", "Who is allowed to manage what", 0),
+        ("Internet door (NAT gateway) + 1 TB updates/mo", "Private servers can download Windows updates safely", nat),
+        ("1 public internet address", "The single entry point into the environment", ip),
+        ("3 TB data out to internet /mo", "Users downloading files, remote sessions", dto),
+        ("Security monitoring", "AWS threat detection + full activity logging", sec),
+    ]
+    env_tbl = "| Included | Why | $/month |\n|---|---|---:|\n"
+    for label, why, cost in ENV_ITEMS:
+        env_tbl += f"| {label} | {why} | {'included' if cost == 0 else f'{cost:,.0f}'} |\n"
+    env_tbl += f"| **Environment subtotal** | | **{shared:,.0f}** |"
+    st.markdown(env_tbl)
+
+    st.markdown("**Totals:**")
 
     st.markdown(
         f"| | $/month |\n|---|---:|\n"
