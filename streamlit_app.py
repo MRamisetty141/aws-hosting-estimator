@@ -1,6 +1,6 @@
 """
 Saratech AWS Hosting Estimator — live-priced website (Streamlit)
-Secrets required: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, APP_PASSCODE (optional)
+Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, APP_PASSCODE (optional)
 IAM permission needed: pricing:GetProducts only.
 """
 import io
@@ -11,42 +11,34 @@ import boto3
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="AWS Hosting Estimator", page_icon="☁️", layout="wide")
+st.set_page_config(page_title="AWS Hosting Estimator", page_icon="☁️", layout="centered")
 
 # ---------------- passcode gate ----------------
 _pass = st.secrets.get("APP_PASSCODE", "")
-if _pass:
-    if not st.session_state.get("auth_ok"):
-        st.title("☁️ AWS Hosting Estimator")
-        entered = st.text_input("Enter access code", type="password")
-        if entered:
-            if entered == _pass:
-                st.session_state.auth_ok = True
-                st.rerun()
-            else:
-                st.error("Wrong code. Ask Mahendra for access.")
-        st.stop()
+if _pass and not st.session_state.get("auth_ok"):
+    st.title("☁️ AWS Hosting Estimator")
+    entered = st.text_input("Enter access code", type="password")
+    if entered:
+        if entered == _pass:
+            st.session_state.auth_ok = True
+            st.rerun()
+        else:
+            st.error("Wrong code. Ask Mahendra for access.")
+    st.stop()
 
 REGION_LOCATION = "US East (N. Virginia)"
 HOURS_MO = 730
 
-# ---- FIXED shared account costs (not user-editable; edit here in code only) ----
+# ---- FIXED shared account costs (edit here in code only) ----
 FIXED = {
-    "nat_gateways": 1,        # every setup needs one internet door for updates
-    "nat_data_gb": 1024,      # 1 TB through the NAT per month
-    "public_ips": 1,          # one public IPv4 address
-    "data_out_gb": 3072,      # 3 TB leaving AWS to the internet per month
-    "security_mo": 30.0,      # GuardDuty + CloudTrail + Inspector baseline
+    "nat_gateways": 1, "nat_data_gb": 1024,      # 1 TB updates through NAT
+    "public_ips": 1, "data_out_gb": 3072,        # 3 TB out to internet
+    "security_mo": 30.0,
     "nat_hr": 0.045, "nat_gb_rate": 0.045, "ip_hr": 0.005, "dto_rate": 0.09,
     "markup": 0.25,
 }
 
-# Commitment discounts applied to the machine+Windows part only (SQL never discounted)
-TERMS = {
-    "Pay monthly (On-Demand)": 1.00,
-    "1-Year commitment (≈22% off machine)": 0.78,
-    "3-Year commitment (≈40% off machine)": 0.60,
-}
+TERM_DISC = {"On-Demand": 1.00, "1-Year": 0.78, "3-Year": 0.60}
 
 MACHINES = [
     ("t3.large", 2, 8), ("t3.xlarge", 4, 16),
@@ -55,8 +47,6 @@ MACHINES = [
     ("r6a.xlarge", 4, 32), ("r6a.2xlarge", 8, 64), ("r6a.4xlarge", 16, 128),
     ("x2iedn.xlarge", 4, 128), ("x2iedn.2xlarge", 8, 256), ("x2iedn.4xlarge", 16, 512),
 ]
-CPU_CHOICES = [2, 4, 8, 12, 16, 24, 32]
-RAM_CHOICES = [8, 16, 32, 64, 96, 128, 256, 512]
 
 
 def _pricing_client():
@@ -128,29 +118,24 @@ def load_prices():
 
 def match(machines, cpu, ram):
     fits = [m for m in machines if m["cpu"] >= cpu and m["ram"] >= ram]
-    return (fits[0], fits) if fits else (None, [])
+    return fits[0] if fits else None
 
 
-def server_cost(p, s):
-    m, _ = match(p["machines"], s["cpu"], s["ram"])
-    if not m:
-        return None
-    hrs = min(s["hours"], 24) * min(s["days"], 31)
-    disc = TERMS[s["term"]]
-    compute = m["win_hr"] * disc * hrs
-    sql_vcpu = max(s["cpu"], 4)
-    sql = sql_vcpu * p["sql_per_vcpu"] * hrs if s["sql"] else 0.0
-    storage = s["disk"] * (p["gp3"] + p["snap"])
-    return {"machine": m, "hrs": hrs, "compute": compute, "sql": sql,
-            "sql_vcpu": sql_vcpu, "storage": storage, "total": compute + sql + storage}
+def costs_all_terms(P, m, need_cpu, sql, disk_gb):
+    out = {}
+    sql_vcpu = max(need_cpu, 4)
+    sql_mo = sql_vcpu * P["sql_per_vcpu"] * HOURS_MO if sql else 0.0
+    disk_mo = disk_gb * P["gp3"]
+    backup_mo = disk_gb * P["snap"]
+    for term, disc in TERM_DISC.items():
+        machine_mo = m["win_hr"] * disc * HOURS_MO
+        out[term] = {"machine": machine_mo, "sql": sql_mo, "disk": disk_mo,
+                     "backup": backup_mo, "total": machine_mo + sql_mo + disk_mo + backup_mo}
+    return out, sql_vcpu
 
 
 # ================= UI =================
 st.title("☁️ AWS Hosting Estimator")
-st.markdown(
-    "Estimate the monthly cost of hosting a client's servers in AWS. "
-    "**Just pick what the client needs — the tool finds the right machine and today's official price automatically.**"
-)
 
 try:
     P = load_prices()
@@ -158,145 +143,142 @@ except Exception as e:
     st.error(f"Could not reach the AWS pricing service. Ask Mahendra to check the app settings. ({e})")
     st.stop()
 
-st.caption(f"✅ Prices are live from AWS, fetched {P['fetched']} (region us-east-1). Nothing here is typed in by hand.")
+st.caption(f"Live official AWS prices, fetched {P['fetched']} · Servers assumed running 24/7 · Region us-east-1")
 
 if "servers" not in st.session_state:
     st.session_state.servers = []
 
-left, right = st.columns([5, 6], gap="large")
+# ---------- 1. server form ----------
+st.header("1 · The server")
+name = st.text_input("Server name", "Teamcenter application server")
+c1, c2 = st.columns(2)
+cpu = int(c1.number_input("CPUs", min_value=1, max_value=64, value=8, step=1))
+ram = int(c2.number_input("Memory RAM (GB)", min_value=4, max_value=1024, value=64, step=4))
+sql = st.toggle("Needs Microsoft SQL Server license (database server)", value=False)
 
-with left:
-    st.subheader("Step 1 — Describe the server the client needs")
-    name = st.text_input("What is this server for?", "Teamcenter application server",
-                         help="Just a label for the estimate, e.g. 'Database server'.")
-    c1, c2 = st.columns(2)
-    cpu = c1.select_slider("How many CPUs?", CPU_CHOICES, value=8,
-                           help="Processor cores the client's software needs.")
-    ram = c2.select_slider("How much memory (RAM, GB)?", RAM_CHOICES, value=64,
-                           help="If the exact size doesn't exist in AWS, the tool automatically takes the next size up.")
-    sql = st.toggle("This server needs a Microsoft SQL Server database license", value=False,
-                    help="Turn ON only for the database server. The license is a big part of the price.")
-    term = st.radio("How long will the client keep this server?", list(TERMS.keys()),
-                    help="Longer commitments get a discount on the machine — but you must pay for the whole period even if the client leaves early. The SQL license price never gets discounted.")
-    c3, c4, c5 = st.columns(3)
-    hours = c3.number_input("Hours ON per day", 1.0, 24.0, 24.0, 1.0,
-                            help="24 = always running. If the server can sleep at night, cost goes down.")
-    days = c4.number_input("Days ON per month", 1.0, 31.0, 30.42, 1.0,
-                           help="30.42 is the standard full month.")
-    disk = c5.number_input("Disk size (GB)", 0, 20000, 300, 50,
-                           help="Hard-disk space. Daily backups (snapshots) are included in the price automatically.")
+st.markdown("**Drives** — add every disk the server needs, like on a real Windows server:")
+default_drives = pd.DataFrame([{"Drive": "C:", "Size (GB)": 150}, {"Drive": "E:", "Size (GB)": 300}])
+drives = st.data_editor(default_drives, num_rows="dynamic", use_container_width=True, key="drives",
+                        column_config={
+                            "Drive": st.column_config.TextColumn(help="Drive letter, e.g. C:, E:, F:"),
+                            "Size (GB)": st.column_config.NumberColumn(min_value=1, max_value=20000, step=50),
+                        })
+disk_gb = int(pd.to_numeric(drives["Size (GB)"], errors="coerce").fillna(0).sum())
+st.caption(f"Total disk: **{disk_gb} GB**. Daily backups are automatic: AWS keeps rolling snapshot copies — "
+           f"they use roughly the same space as the disks (≈{disk_gb} GB), priced at $0.05 per GB per month.")
 
-    m, _ = match(P["machines"], cpu, ram)
-    if not m:
-        st.error(f"AWS has no machine with {cpu} CPU / {ram} GB in our list. Pick a smaller size, "
-                 "or ask Mahendra to add bigger machines.")
-    else:
-        exact = (m["cpu"] == cpu and m["ram"] == ram)
-        if exact:
-            st.success(f"✅ Perfect fit: AWS machine **{m['type']}** — exactly {m['cpu']} CPU / {m['ram']} GB.")
-        else:
-            msg = (f"ℹ️ AWS has no machine with exactly {cpu} CPU / {ram} GB — machine sizes are fixed, like T-shirt sizes. "
-                   f"The tool picked the **cheapest machine that is big enough**: **{m['type']}** "
-                   f"({m['cpu']} CPU / {m['ram']} GB). The client pays for this whole machine.")
-            st.warning(msg)
-            if sql and m["cpu"] > cpu:
-                save = (m["cpu"] - max(cpu, 4)) * P["sql_per_vcpu"] * HOURS_MO
-                st.info(f"✂️ Good news: the expensive SQL license is only charged on the **{max(cpu,4)} CPUs the client "
-                        f"actually needs**, not all {m['cpu']} — that saves about **${save:,.0f} every month**.")
-            if not sql and m["cpu"] > cpu:
-                st.info("The extra CPUs and RAM come with the machine at no extra choice — "
-                        "without a SQL license there is nothing more to save here.")
+# ---------- 2. machine + prices ----------
+st.header("2 · What AWS offers for this")
+m = match(P["machines"], cpu, ram)
+if not m:
+    st.error(f"AWS has no machine with {cpu} CPU / {ram} GB in our list. Reduce the size, "
+             "or ask Mahendra to add larger machines.")
+    st.stop()
 
-        pv = server_cost(P, {"cpu": cpu, "ram": ram, "sql": sql, "term": term,
-                             "hours": hours, "days": days, "disk": disk})
-        st.markdown(
-            f"| What you pay for | $/month |\n|---|---:|\n"
-            f"| The machine itself, with Windows | {pv['compute']:,.0f} |\n"
-            + (f"| Microsoft SQL Server license (on {pv['sql_vcpu']} CPUs) | {pv['sql']:,.0f} |\n" if sql else "")
-            + f"| Disk {disk} GB + daily backups | {pv['storage']:,.0f} |\n"
-            + f"| **This server, total** | **{pv['total']:,.0f}** |"
-        )
-        if st.button("➕ Add this server to the estimate", type="primary", use_container_width=True):
-            st.session_state.servers.append(
-                {"name": name, "cpu": cpu, "ram": ram, "sql": sql, "term": term,
-                 "hours": hours, "days": days, "disk": disk})
-            st.rerun()
+if m["cpu"] == cpu and m["ram"] == ram:
+    st.success(f"Perfect fit: **{m['type']}** — exactly {m['cpu']} CPU / {m['ram']} GB.")
+else:
+    st.warning(f"AWS machine sizes are fixed (like T-shirt sizes) — there is no exact {cpu} CPU / {ram} GB. "
+               f"Cheapest machine big enough: **{m['type']}** with {m['cpu']} CPU / {m['ram']} GB. "
+               f"The client pays for this whole machine.")
 
-with right:
-    st.subheader("Step 2 — The estimate")
-    rows = [(s, server_cost(P, s)) for s in st.session_state.servers]
-    rows = [(s, c) for s, c in rows if c]
+CT, sql_vcpu = costs_all_terms(P, m, cpu, sql, disk_gb)
+if sql and m["cpu"] > cpu:
+    save = (m["cpu"] - sql_vcpu) * P["sql_per_vcpu"] * HOURS_MO
+    st.info(f"✂️ The SQL license is charged only on the **{sql_vcpu} CPUs the client needs**, "
+            f"not all {m['cpu']} — saving about **${save:,.0f}/month**.")
 
-    if not rows:
-        st.info("No servers added yet. Describe one on the left and press **Add this server to the estimate**.")
-    for i, (s, c) in enumerate(rows):
-        col1, col2, col3 = st.columns([6, 2, 1])
-        col1.markdown(f"**{s['name']}** — needs {s['cpu']} CPU / {s['ram']} GB → {c['machine']['type']}"
-                      + (", with SQL" if s["sql"] else "") + f" · {s['term'].split(' (')[0]}")
-        col2.markdown(f"**${c['total']:,.0f}**")
-        if col3.button("✕", key=f"rm{i}", help="Remove this server"):
+st.markdown("**Monthly cost of this server — three ways to pay:**")
+tbl = "| | Pay monthly | 1-Year commitment | 3-Year commitment |\n|---|---:|---:|---:|\n"
+tbl += "| Machine + Windows | " + " | ".join(f"${CT[t]['machine']:,.0f}" for t in TERM_DISC) + " |\n"
+if sql:
+    tbl += "| SQL Server license | " + " | ".join(f"${CT[t]['sql']:,.0f}" for t in TERM_DISC) + " |\n"
+tbl += "| Disks (" + str(disk_gb) + " GB) | " + " | ".join(f"${CT[t]['disk']:,.0f}" for t in TERM_DISC) + " |\n"
+tbl += "| Daily backups | " + " | ".join(f"${CT[t]['backup']:,.0f}" for t in TERM_DISC) + " |\n"
+tbl += "| **Total / month** | " + " | ".join(f"**${CT[t]['total']:,.0f}**" for t in TERM_DISC) + " |"
+st.markdown(tbl)
+st.caption("Commitments discount only the machine — never the SQL license, disks or backups. "
+           "A commitment must be paid for the whole period, even if the client leaves early.")
+
+term = st.radio("Which pricing do you want in the estimate?", list(TERM_DISC.keys()), horizontal=True)
+if st.button(f"➕ Add '{name}' to the estimate ({term}: ${CT[term]['total']:,.0f}/mo)",
+             type="primary", use_container_width=True):
+    st.session_state.servers.append({"name": name, "cpu": cpu, "ram": ram, "sql": sql,
+                                     "disk": disk_gb, "term": term,
+                                     "drives": ", ".join(f"{r['Drive']} {int(r['Size (GB)'])}GB"
+                                                          for _, r in drives.iterrows()
+                                                          if pd.notna(r["Size (GB)"]))})
+    st.rerun()
+
+# ---------- 3. estimate ----------
+st.header("3 · The estimate")
+if not st.session_state.servers:
+    st.info("No servers added yet.")
+else:
+    total_rows = []
+    server_total = 0.0
+    for i, s in enumerate(st.session_state.servers):
+        mm = match(P["machines"], s["cpu"], s["ram"])
+        ct, sv = costs_all_terms(P, mm, s["cpu"], s["sql"], s["disk"])
+        c = ct[s["term"]]
+        server_total += c["total"]
+        col1, col2, col3 = st.columns([7, 2, 1])
+        col1.markdown(f"**{s['name']}** — {s['cpu']} CPU / {s['ram']} GB → {mm['type']} · "
+                      f"{s['drives']} · {s['term']}" + (" · SQL" if s["sql"] else ""))
+        col2.markdown(f"**${c['total']:,.0f}/mo**")
+        if col3.button("✕", key=f"rm{i}"):
             st.session_state.servers.pop(i)
             st.rerun()
-    server_total = sum(c["total"] for _, c in rows)
+        total_rows.append({"Server": s["name"], "Needs": f"{s['cpu']} CPU / {s['ram']} GB",
+                           "AWS machine": mm["type"], "Drives": s["drives"], "Term": s["term"],
+                           "SQL": f"Yes (on {sv} CPUs)" if s["sql"] else "No",
+                           "Machine $": round(c["machine"]), "SQL $": round(c["sql"]),
+                           "Disks $": round(c["disk"]), "Backups $": round(c["backup"]),
+                           "Total $/mo": round(c["total"])})
 
-    nat_cost = FIXED["nat_gateways"] * FIXED["nat_hr"] * HOURS_MO + FIXED["nat_data_gb"] * FIXED["nat_gb_rate"]
-    ip_cost = FIXED["public_ips"] * FIXED["ip_hr"] * HOURS_MO
-    dto_cost = FIXED["data_out_gb"] * FIXED["dto_rate"]
-    sec_cost = FIXED["security_mo"]
-    shared_total = nat_cost + ip_cost + dto_cost + sec_cost
-    aws_total = server_total + shared_total
+    nat = FIXED["nat_gateways"] * FIXED["nat_hr"] * HOURS_MO + FIXED["nat_data_gb"] * FIXED["nat_gb_rate"]
+    ip = FIXED["public_ips"] * FIXED["ip_hr"] * HOURS_MO
+    dto = FIXED["data_out_gb"] * FIXED["dto_rate"]
+    sec = FIXED["security_mo"]
+    shared = nat + ip + dto + sec
+    aws_total = server_total + shared
     client_mo = aws_total * (1 + FIXED["markup"])
-
-    st.markdown("**Always included (same for every setup — cannot be changed here):**")
-    st.markdown(
-        f"| Item | Why it's needed | $/month |\n|---|---|---:|\n"
-        f"| Internet door (NAT gateway) + 1 TB of updates | Lets private servers download Windows updates safely | {nat_cost:,.0f} |\n"
-        f"| 1 public internet address | The connection point into the environment | {ip_cost:,.0f} |\n"
-        f"| 3 TB of data leaving AWS per month | Users downloading files, remote sessions | {dto_cost:,.0f} |\n"
-        f"| Security monitoring | AWS threat detection + activity logging | {sec_cost:,.0f} |\n"
-        f"| **Always-included subtotal** | | **{shared_total:,.0f}** |"
-    )
 
     st.markdown(
         f"| | $/month |\n|---|---:|\n"
         f"| All servers | {server_total:,.0f} |\n"
-        f"| Always included | {shared_total:,.0f} |\n"
+        f"| Internet door (NAT) + 1 TB updates — fixed | {nat:,.0f} |\n"
+        f"| 1 public internet address — fixed | {ip:,.0f} |\n"
+        f"| 3 TB data out to internet — fixed | {dto:,.0f} |\n"
+        f"| Security monitoring — fixed | {sec:,.0f} |\n"
         f"| **AWS cost** | **{aws_total:,.0f}** |\n"
-        f"| Saratech service margin (25%) | {aws_total * FIXED['markup']:,.0f} |\n"
-        f"| **Price to client, per month** | **{client_mo:,.0f}** |\n"
-        f"| Price to client, per year | {client_mo * 12:,.0f} |"
+        f"| Saratech service margin 25% | {aws_total * FIXED['markup']:,.0f} |\n"
+        f"| **Price to client / month** | **{client_mo:,.0f}** |\n"
+        f"| Price to client / year | {client_mo * 12:,.0f} |"
     )
 
-    if rows:
-        df = pd.DataFrame([{
-            "Server": s["name"], "Client needs": f"{s['cpu']} CPU / {s['ram']} GB",
-            "AWS machine": f"{c['machine']['type']} ({c['machine']['cpu']} CPU / {c['machine']['ram']} GB)",
-            "Term": s["term"].split(" (")[0],
-            "SQL license": f"Yes, on {c['sql_vcpu']} CPUs" if s["sql"] else "No",
-            "Hours/month": round(c["hrs"]), "Machine $": round(c["compute"]),
-            "SQL $": round(c["sql"]), "Disk+backup $": round(c["storage"]), "Total $/mo": round(c["total"]),
-        } for s, c in rows])
-        summary = pd.DataFrame([
-            {"Item": "All servers", "$/month": round(server_total)},
-            {"Item": "Internet door (NAT) + 1 TB updates", "$/month": round(nat_cost)},
-            {"Item": "1 public internet address", "$/month": round(ip_cost)},
-            {"Item": "3 TB data out to internet", "$/month": round(dto_cost)},
-            {"Item": "Security monitoring", "$/month": round(sec_cost)},
-            {"Item": "AWS cost", "$/month": round(aws_total)},
-            {"Item": "Saratech margin 25%", "$/month": round(aws_total * FIXED["markup"])},
-            {"Item": "PRICE TO CLIENT / month", "$/month": round(client_mo)},
-            {"Item": "Price to client / year", "$/month": round(client_mo * 12)},
-        ])
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-            df.to_excel(xw, sheet_name="Servers", index=False)
-            summary.to_excel(xw, sheet_name="Totals", index=False)
-        st.download_button("⬇️ Download this estimate as Excel", buf.getvalue(),
-                           file_name="AWS_Hosting_Estimate.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+    df = pd.DataFrame(total_rows)
+    summary = pd.DataFrame([
+        {"Item": "All servers", "$/month": round(server_total)},
+        {"Item": "NAT + 1 TB updates (fixed)", "$/month": round(nat)},
+        {"Item": "1 public IP (fixed)", "$/month": round(ip)},
+        {"Item": "3 TB data out (fixed)", "$/month": round(dto)},
+        {"Item": "Security monitoring (fixed)", "$/month": round(sec)},
+        {"Item": "AWS cost", "$/month": round(aws_total)},
+        {"Item": "Saratech margin 25%", "$/month": round(aws_total * FIXED["markup"])},
+        {"Item": "PRICE TO CLIENT / month", "$/month": round(client_mo)},
+        {"Item": "Price to client / year", "$/month": round(client_mo * 12)},
+    ])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="Servers", index=False)
+        summary.to_excel(xw, sheet_name="Totals", index=False)
+    st.download_button("⬇️ Download estimate as Excel", buf.getvalue(),
+                       file_name="AWS_Hosting_Estimate.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
 
 st.divider()
-st.caption("How to read this: disks, backups and the always-included items keep billing even when servers are OFF — "
-           "only the machine price stops. Commitment discounts apply to the machine only, never to the SQL license. "
-           "SQL has a 4-CPU license minimum. All machine prices come live from AWS's official price list.")
+st.caption("Servers run 24/7. Disks, backups and the fixed items bill around the clock. "
+           "SQL Server has a 4-CPU license minimum. Machine prices come live from AWS's official price list; "
+           "1-Year/3-Year use standard commitment discounts (≈22% / ≈40% on the machine only).")
