@@ -119,6 +119,13 @@ def load_prices(catalog_version="all-v1"):
             itype = attrs.get("instanceType", "")
             if not itype or ".metal" in itype:
                 continue
+            fam = itype.split(".")[0]
+            # exclude AI-training / special hardware entirely (never for client servers)
+            if fam.startswith(("p2", "p3", "p4", "p5", "p6",
+                               "trn", "inf", "dl", "f1", "f2", "vt1", "mac", "hpc")):
+                continue
+            # graphics GPU machines (NX/CAD workstations) are kept but tagged
+            is_gpu = fam.startswith(("g3", "g4", "g5", "g6")) or attrs.get("gpu", "0") not in ("", "0", "NA")
             try:
                 cpu = int(attrs.get("vcpu", "0"))
                 ram = float(attrs.get("memory", "0").replace(" GiB", "").replace(",", ""))
@@ -135,7 +142,7 @@ def load_prices(catalog_version="all-v1"):
             if price is None:
                 continue
             if itype not in best or price < best[itype]["win_hr"]:
-                best[itype] = {"type": itype, "cpu": cpu, "ram": ram, "win_hr": price}
+                best[itype] = {"type": itype, "cpu": cpu, "ram": ram, "win_hr": price, "gpu": is_gpu}
         token = resp.get("NextToken")
         if not token:
             break
@@ -149,8 +156,8 @@ def load_prices(catalog_version="all-v1"):
             "fetched": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
 
 
-def match(machines, cpu, ram):
-    fits = [m for m in machines if m["cpu"] >= cpu and m["ram"] >= ram]
+def match(machines, cpu, ram, gpu=False):
+    fits = [m for m in machines if m["cpu"] >= cpu and m["ram"] >= ram and m.get("gpu", False) == gpu]
     return fits[0] if fits else None
 
 
@@ -181,6 +188,7 @@ st.caption(f"Live official AWS prices, fetched {P['fetched']} · Servers assumed
 with st.expander(f"🔍 Complete AWS catalog — {len(P['machines'])} machines with today's prices"):
     st.dataframe(pd.DataFrame([
         {"Machine": r["type"], "CPU": r["cpu"], "RAM GB": r["ram"],
+         "GPU": "Yes" if r.get("gpu") else "",
          "Windows $/hr": round(r["win_hr"], 5)}
         for r in P["machines"]
     ]), use_container_width=True, hide_index=True)
@@ -195,6 +203,8 @@ c1, c2 = st.columns(2)
 cpu = int(c1.number_input("CPUs", min_value=1, max_value=64, value=8, step=1))
 ram = int(c2.number_input("Memory RAM (GB)", min_value=4, max_value=1024, value=64, step=4))
 sql = st.toggle("Needs Microsoft SQL Server license (database server)", value=False)
+gpu = st.toggle("Needs a graphics card (GPU) — CAD/NX workstation", value=False,
+                help="Turn ON only for engineering workstations that run NX or other 3D CAD. Normal app and database servers do NOT need this.")
 
 st.markdown("**Drives** — add every disk the server needs, like on a real Windows server:")
 default_drives = pd.DataFrame([{"Drive": "C:", "Size (GB)": 150}, {"Drive": "E:", "Size (GB)": 300}])
@@ -209,14 +219,15 @@ st.caption(f"Total disk: **{disk_gb} GB**. Daily backups are automatic: AWS keep
 
 # ---------- 2. machine + prices ----------
 st.header("2 · What AWS offers for this")
-m = match(P["machines"], cpu, ram)
+m = match(P["machines"], cpu, ram, gpu)
 if not m:
     st.error(f"AWS has no machine with {cpu} CPU / {ram} GB in our list. Reduce the size, "
              "or ask Mahendra to add larger machines.")
     st.stop()
 
 if m["cpu"] == cpu and m["ram"] == ram:
-    st.success(f"Perfect fit: **{m['type']}** — exactly {m['cpu']} CPU / {m['ram']} GB.")
+    st.success(f"Perfect fit: **{m['type']}** — exactly {m['cpu']} CPU / {m['ram']:.0f} GB"
+               + (" with GPU graphics card." if gpu else "."))
 else:
     st.warning(f"AWS machine sizes are fixed (like T-shirt sizes) — there is no exact {cpu} CPU / {ram} GB. "
                f"Cheapest machine big enough: **{m['type']}** with {m['cpu']} CPU / {m['ram']} GB. "
@@ -246,7 +257,7 @@ term = st.radio("Which pricing do you want in the estimate?", list(TERM_DISC.key
 allin = (CT[term]["total"] + ENV_TOTAL) * (1 + FIXED["markup"])
 if st.button(f"➕ Add '{name}' to the estimate — pay amount ${allin:,.0f}/mo everything included",
              type="primary", use_container_width=True):
-    st.session_state.servers.append({"name": name, "cpu": cpu, "ram": ram, "sql": sql,
+    st.session_state.servers.append({"name": name, "cpu": cpu, "ram": ram, "sql": sql, "gpu": gpu,
                                      "disk": disk_gb, "term": term,
                                      "drives": ", ".join(f"{r['Drive']} {int(r['Size (GB)'])}GB"
                                                           for _, r in drives.iterrows()
@@ -261,7 +272,7 @@ else:
     total_rows = []
     server_total = 0.0
     for i, s in enumerate(st.session_state.servers):
-        mm = match(P["machines"], s["cpu"], s["ram"])
+        mm = match(P["machines"], s["cpu"], s["ram"], s.get("gpu", False))
         ct, sv = costs_all_terms(P, mm, s["cpu"], s["sql"], s["disk"])
         c = ct[s["term"]]
         server_total += c["total"]
