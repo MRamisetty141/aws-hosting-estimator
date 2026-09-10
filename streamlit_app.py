@@ -46,23 +46,7 @@ ENV_DTO = FIXED["data_out_gb"] * FIXED["dto_rate"]
 ENV_SEC = FIXED["security_mo"]
 ENV_TOTAL = ENV_NAT + ENV_IP + ENV_DTO + ENV_SEC
 
-MACHINES = [
-    # small / general
-    ("t3.large", 2, 8), ("t3.xlarge", 4, 16), ("t3.2xlarge", 8, 32),
-    # compute-lean (low RAM per CPU)
-    ("c6i.xlarge", 4, 8), ("c6i.2xlarge", 8, 16), ("c6i.4xlarge", 16, 32), ("c6i.8xlarge", 32, 64),
-    # balanced
-    ("m6i.xlarge", 4, 16), ("m6i.2xlarge", 8, 32), ("m6i.4xlarge", 16, 64),
-    ("m6i.8xlarge", 32, 128), ("m6i.12xlarge", 48, 192), ("m6i.16xlarge", 64, 256),
-    # memory-heavy (databases)
-    ("r6a.xlarge", 4, 32), ("r6a.2xlarge", 8, 64), ("r6a.4xlarge", 16, 128), ("r6a.8xlarge", 32, 256),
-    ("r6i.xlarge", 4, 32), ("r6i.2xlarge", 8, 64), ("r6i.4xlarge", 16, 128),
-    ("r6i.8xlarge", 32, 256), ("r6i.12xlarge", 48, 384), ("r6i.16xlarge", 64, 512),
-    # extreme memory per CPU
-    ("x8i.2xlarge", 8, 128), ("x8i.4xlarge", 16, 256),
-    ("x2iedn.xlarge", 4, 128), ("x2iedn.2xlarge", 8, 256),
-    ("x2iedn.4xlarge", 16, 512), ("x2iedn.8xlarge", 32, 1024),
-]
+
 
 
 def _pricing_client():
@@ -110,25 +94,58 @@ def _storage_rate(client, api_name):
     return None
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="Getting today's official AWS prices…")
-def load_prices():
+@st.cache_data(ttl=6 * 3600, show_spinner="Downloading AWS's complete machine catalog with today's prices… (~1 minute, then instant for everyone)")
+def load_prices(catalog_version="all-v1"):
     client = _pricing_client()
-    rows = []
-    for itype, cpu, ram in MACHINES:
-        win = _od_price(client, itype, sql=False)
-        wsql = _od_price(client, itype, sql=True)
-        if win is None:
-            continue
-        rows.append({"type": itype, "cpu": cpu, "ram": ram, "win_hr": win,
-                     "sql_hr_full": (wsql - win) if wsql else None})
-    per_vcpu = None
-    for r in rows:
-        if r["sql_hr_full"]:
-            per_vcpu = r["sql_hr_full"] / r["cpu"]
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "location", "Value": REGION_LOCATION},
+        {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Windows"},
+        {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+        {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
+        {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
+        {"Type": "TERM_MATCH", "Field": "licenseModel", "Value": "No License required"},
+        {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Compute Instance"},
+    ]
+    best = {}
+    token = None
+    while True:
+        kw = {"ServiceCode": "AmazonEC2", "Filters": filters, "MaxResults": 100}
+        if token:
+            kw["NextToken"] = token
+        resp = client.get_products(**kw)
+        for item in resp["PriceList"]:
+            prod = json.loads(item)
+            attrs = prod.get("product", {}).get("attributes", {})
+            itype = attrs.get("instanceType", "")
+            if not itype or ".metal" in itype:
+                continue
+            try:
+                cpu = int(attrs.get("vcpu", "0"))
+                ram = float(attrs.get("memory", "0").replace(" GiB", "").replace(",", ""))
+            except ValueError:
+                continue
+            if cpu <= 0 or ram <= 0:
+                continue
+            price = None
+            for term in prod.get("terms", {}).get("OnDemand", {}).values():
+                for dim in term["priceDimensions"].values():
+                    usd = float(dim["pricePerUnit"]["USD"])
+                    if usd > 0:
+                        price = usd
+            if price is None:
+                continue
+            if itype not in best or price < best[itype]["win_hr"]:
+                best[itype] = {"type": itype, "cpu": cpu, "ram": ram, "win_hr": price}
+        token = resp.get("NextToken")
+        if not token:
             break
+    rows = sorted(best.values(), key=lambda r: r["win_hr"])
+    # SQL per-vCPU rate derived live from one known pair
+    win = _od_price(client, "m6i.2xlarge", sql=False)
+    wsql = _od_price(client, "m6i.2xlarge", sql=True)
+    per_vcpu = (wsql - win) / 8 if (win and wsql) else 0.12
     gp3 = _storage_rate(client, "gp3") or 0.08
-    rows.sort(key=lambda r: r["win_hr"])
-    return {"machines": rows, "sql_per_vcpu": per_vcpu or 0.12, "gp3": gp3, "snap": 0.05,
+    return {"machines": rows, "sql_per_vcpu": per_vcpu, "gp3": gp3, "snap": 0.05,
             "fetched": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
 
 
@@ -161,18 +178,12 @@ except Exception as e:
 
 st.caption(f"Live official AWS prices, fetched {P['fetched']} · Servers assumed running 24/7 · Region us-east-1")
 
-with st.expander("🔍 See all machines and today's prices (for checking)"):
+with st.expander(f"🔍 Complete AWS catalog — {len(P['machines'])} machines with today's prices"):
     st.dataframe(pd.DataFrame([
         {"Machine": r["type"], "CPU": r["cpu"], "RAM GB": r["ram"],
-         "Windows $/hr": round(r["win_hr"], 5),
-         "SQL portion $/hr": round(r["sql_hr_full"], 5) if r["sql_hr_full"] else None}
+         "Windows $/hr": round(r["win_hr"], 5)}
         for r in P["machines"]
     ]), use_container_width=True, hide_index=True)
-    priced = {r["type"] for r in P["machines"]}
-    missing = [t for t, _, _ in MACHINES if t not in priced]
-    if missing:
-        st.warning("No price found for: " + ", ".join(missing) +
-                   " — these machines are ignored by the matcher until pricing works.")
 
 if "servers" not in st.session_state:
     st.session_state.servers = []
