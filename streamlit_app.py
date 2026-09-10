@@ -247,14 +247,14 @@ if sql:
 tbl += "| Disks (" + str(disk_gb) + " GB) | " + " | ".join(f"${CT[t]['disk']:,.0f}" for t in TERM_DISC) + " |\n"
 tbl += "| Daily backups | " + " | ".join(f"${CT[t]['backup']:,.0f}" for t in TERM_DISC) + " |\n"
 tbl += "| **Total / month** | " + " | ".join(f"**${CT[t]['total']:,.0f}**" for t in TERM_DISC) + " |"
-tbl += "\n| **PAY AMOUNT — everything included (server + environment + 25%)** | " + " | ".join(f"**${(CT[t]['total'] + ENV_TOTAL) * (1 + FIXED['markup']):,.0f}**" for t in TERM_DISC) + " |"
+tbl += "\n| **PAY AMOUNT — server + environment (environment charged once per setup)** | " + " | ".join(f"**${CT[t]['total'] + ENV_TOTAL:,.0f}**" for t in TERM_DISC) + " |"
 st.markdown(tbl)
-st.caption("The PAY AMOUNT row is the complete monthly price for a one-server setup — nothing to add on top. With several servers the environment is charged once (see section 3). "
+st.caption("The PAY AMOUNT row is the complete monthly cost for a one-server setup. The environment (network, internet door, security) is charged ONE time for the whole setup — adding more servers does not repeat it. "
            "Commitments discount only the machine — never the SQL license, disks or backups. "
            "A commitment must be paid for the whole period, even if the client leaves early.")
 
 term = st.radio("Which pricing do you want in the estimate?", list(TERM_DISC.keys()), horizontal=True)
-allin = (CT[term]["total"] + ENV_TOTAL) * (1 + FIXED["markup"])
+allin = CT[term]["total"] + ENV_TOTAL
 if st.button(f"➕ Add '{name}' to the estimate — pay amount ${allin:,.0f}/mo everything included",
              type="primary", use_container_width=True):
     st.session_state.servers.append({"name": name, "cpu": cpu, "ram": ram, "sql": sql, "gpu": gpu,
@@ -293,9 +293,9 @@ else:
     nat, ip, dto, sec = ENV_NAT, ENV_IP, ENV_DTO, ENV_SEC
     shared = ENV_TOTAL
     aws_total = server_total + shared
-    client_mo = aws_total * (1 + FIXED["markup"])
+    client_mo = aws_total
 
-    st.markdown("**The complete environment** — everything Saratech creates in the client's dedicated AWS account:")
+    st.markdown("**The complete environment** — created ONE time for the whole setup (shared by all servers):")
     ENV_ITEMS = [
         ("Dedicated AWS account for this client", "Their own isolated space, own bill", 0),
         ("Private network (VPC)", "The client's own fenced network inside AWS", 0),
@@ -324,10 +324,8 @@ else:
         f"| 1 public internet address — fixed | {ip:,.0f} |\n"
         f"| 3 TB data out to internet — fixed | {dto:,.0f} |\n"
         f"| Security monitoring — fixed | {sec:,.0f} |\n"
-        f"| **AWS cost** | **{aws_total:,.0f}** |\n"
-        f"| Saratech service margin 25% | {aws_total * FIXED['markup']:,.0f} |\n"
-        f"| **Price to client / month** | **{client_mo:,.0f}** |\n"
-        f"| Price to client / year | {client_mo * 12:,.0f} |"
+        f"| **Total / month** | **{aws_total:,.0f}** |\n"
+        f"| Total / year | {aws_total * 12:,.0f} |"
     )
 
     df = pd.DataFrame(total_rows)
@@ -337,10 +335,8 @@ else:
         {"Item": "1 public IP (fixed)", "$/month": round(ip)},
         {"Item": "3 TB data out (fixed)", "$/month": round(dto)},
         {"Item": "Security monitoring (fixed)", "$/month": round(sec)},
-        {"Item": "AWS cost", "$/month": round(aws_total)},
-        {"Item": "Saratech margin 25%", "$/month": round(aws_total * FIXED["markup"])},
-        {"Item": "PRICE TO CLIENT / month", "$/month": round(client_mo)},
-        {"Item": "Price to client / year", "$/month": round(client_mo * 12)},
+        {"Item": "TOTAL / month", "$/month": round(aws_total)},
+        {"Item": "Total / year", "$/month": round(aws_total * 12)},
     ])
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
